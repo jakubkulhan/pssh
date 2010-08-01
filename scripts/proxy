@@ -1,0 +1,176 @@
+#!/usr/bin/php
+<?php
+require_once dirname(__FILE__) . '/flags.php';
+
+flags::process($flags = flags::define(function ($flags) use (&$host, &$port, &$uri) {
+    $flags->stringVar($host, 'host', 'HTTP host you want to connect to');
+    $flags->intVar($port, 'port', 'port on which server listens (default is 80)', 80);
+    $flags->stringVar($uri, 'uri', 'URI through will which the communication will happen');
+}));
+
+if (empty($host) || empty($uri)) {
+    echo $flags->generateUsage();
+    die(-1);
+}
+
+stream_set_blocking(STDIN, 0);
+
+$random = sha1(uniqid('', TRUE));
+
+if (!($socketin = @fsockopen($host, $port, $errno, $errstr, 10))) {
+    die(3);
+}
+
+$request = "POST $uri HTTP/1.1\r\n" .
+           "Host: $host\r\n" .
+           "X-Connection: connect\r\n" .
+           "Content-Length: " . strlen($random) . "\r\n" .
+           "Content-Type: application/octet-stream\r\n" .
+           "Connection: close\r\n" .
+           "\r\n" .
+           "$random";
+
+if (fwriteall($socketin, $request) === FALSE) {
+    die(5);
+}
+
+$answer = fgets($socketin);
+if ($answer === FALSE) {
+    die(6);
+}
+
+list($http, $code, $reason) = explode(' ', trim($answer), 3);
+$headers = array();
+
+if (intval($code) !== 200) {
+    die(66);
+}
+
+for (;;) {
+    $line = fgets($socketin);
+    if ($line === FALSE) {
+        die(7);
+    }
+
+    $line = trim($line);
+
+    if (empty($line)) {
+        break;
+    }
+
+    list($header, $content) = explode(':', $line, 2);
+    $headers[strtolower($header)] = trim($content);
+}
+
+if (!isset($headers['x-connection'])) {
+    die(8);
+}
+
+$connection = $headers['x-connection'];
+
+if (!(isset($headers['transfer-encoding']) && $headers['transfer-encoding'] === 'chunked')) {
+    die(9);
+}
+
+for (;;) {
+    $r = array(STDIN, $socketin);
+    $w = $e = NULL;
+
+    if (stream_select($r, $w, $e, 0x7fffffff) === FALSE) {
+        die(10);
+    }
+
+    foreach ($r as $socket) {
+        if ($socket === $socketin) {
+            if (($chunksize = fgets($socketin)) === FALSE) {
+                die(11);
+            }
+
+            $packetsize = intval($chunksize, 16);
+
+            if ($packetsize < 1) {
+                break 2;
+            }
+
+            if (($packet = fread($socketin, $packetsize)) === FALSE || strlen($packet) !== $packetsize) {
+                die(12);
+            }
+
+            fgets($socketin); // throw away new line
+
+            if ($packet[0] !== "\x00") { // not still alive packet
+                $packet = substr($packet, 1);
+
+                //fwrite(STDERR, $packet);
+
+                if (fwriteall(STDOUT, $packet) === FALSE) {
+                    die(13);
+                }
+            }
+
+        } else if ($socket === STDIN) {
+            $packet = '';
+            $packetsize = 0;
+            while (($packet .= fread(STDIN, 4096)) !== FALSE && !empty($packet) && strlen($packet) > $packetsize) {
+                $packetsize = strlen($packet);
+            }
+
+            if (!empty($packet)) {
+                //fwrite(STDERR, $packet);
+
+                $request = "POST $uri HTTP/1.1\r\n" .
+                           "Host: $host\r\n" .
+                           "X-Connection: $connection\r\n" .
+                           "Content-Length: " . strlen($packet) . "\r\n" .
+                           "Content-Type: application/octet-stream\r\n" .
+                           "Connection: close\r\n" .
+                           "\r\n" .
+                           "$packet";
+
+                if (!($socketout = @fsockopen($host, $port, $errno, $errstr, 10))) {
+                    die(4);
+                }
+
+                if (fwriteall($socketout, $request) === FALSE) {
+                    die(15);
+                }
+
+                if (($response = fgets($socketout)) === FALSE) {
+                    die(16);
+                }
+
+                list($http, $code, $reason) = explode(' ', $response, 3);
+
+                if (intval($code) !== 200) {
+                    die(17);
+                }
+
+                fclose($socketout); // really do not care about response
+            }
+        }
+
+        if (feof($socket)) {
+            break 2;
+        }
+    }
+}
+
+fclose($socketin);
+
+function fwriteall($handle, $data)
+{
+    $bytes_left = strlen($data);
+    $length = strlen($data);
+
+    while ($bytes_left > 0) {
+        $written = fwrite($handle, substr($data, $length - $bytes_left));
+
+        if ($written === FALSE) {
+            return FALSE;
+        }
+
+        $bytes_left -= $written;
+    }
+
+    return TRUE;
+}

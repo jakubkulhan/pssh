@@ -1,0 +1,24 @@
+#!/usr/bin/php
+<?php
+require_once __DIR__ . '/../sh/exceptions.php';
+require_once __DIR__ . '/../sh/executors.php';
+require_once __DIR__ . '/../sh/utilities.php';
+require_once __DIR__ . '/../sh/sh.php';
+
+$sh = new sh\sh(
+    array('sh'),
+    $_SERVER,
+    array(
+        0 => STDIN,
+        1 => STDOUT,
+        2 => STDERR
+    ),
+    new sh\PhpExecutor('sh\utilities', array(
+        'echo' => 'echo_',
+        'false' => 'false_',
+        'true' => 'true_',
+        '[' => 'test',
+    ))
+);
+
+exit($sh->main());
