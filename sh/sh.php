@@ -50,7 +50,6 @@ class sh
 
         $this->descriptors = $descriptors;
         $this->input = $descriptors[0];
-        stream_set_blocking($this->input, 0);
 
         $this->executor = $executor;
     }

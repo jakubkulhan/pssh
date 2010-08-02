@@ -101,6 +101,7 @@ class PacketProtocol
     /**
      * Send packet
      * @param string see format()
+     * @return void
      */
     public function send($format)
     {

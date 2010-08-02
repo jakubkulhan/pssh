@@ -13,7 +13,6 @@ class StreamedResponse
      */
     public function stream_open($path, $mode, $options, &$opened_path)
     {
-        $opened_path = $path;
         return TRUE;
     }
 
@@ -40,4 +39,4 @@ class StreamedResponse
     }
 }
 
-stream_wrapper_register(StreamedResponse::PROTOCOL, 'ssh\utils\StreamedResponse');
+stream_wrapper_register(StreamedResponse::PROTOCOL, __NAMESPACE__ . '\StreamedResponse');
