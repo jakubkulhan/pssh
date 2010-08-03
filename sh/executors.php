@@ -34,8 +34,29 @@ class PhpExecutor implements Executor
      */
     public function exec(array $argv, array $envp, array $descriptors)
     {
-        if (!function_exists($fn = '\\' . $this->namespace . '\\' .
-                (isset($this->rewrites[$argv[0]]) ? $this->rewrites[$argv[0]] : $argv[0]))) {
+        $fn = '\\' . $this->namespace . '\\';
+
+        if (isset($this->rewrites[$argv[0]])) {
+            $fn .= $this->rewrites[$argv[0]];
+
+        } else if ($argv[0] === '[') {
+            $fn .= 'test';
+
+        } else if (!function_exists($fn . $argv[0]) &&
+            function_exists($fn . $argv[0] . '_'))
+        {
+            $fn .= $argv[0] . '_';
+
+        } else if (!function_exists($fn . $argv[0]) &&
+            function_exists($fn . str_replace('-', '_', $argv[0])))
+        {
+            $fn .= str_replace('-', '_', $argv[0]);
+
+        } else {
+            $fn .= $argv[0];
+        }
+
+        if (!function_exists($fn)) {
             return 127;
         }
 

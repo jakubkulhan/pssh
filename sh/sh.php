@@ -3,6 +3,10 @@ namespace sh;
 
 class sh
 {
+    const DEFAULT_PS1 = '$ ';
+
+    const DEFAULT_PS2 = '> ';
+
     /** @var array */
     private $argv;
 
@@ -10,7 +14,13 @@ class sh
     private $envp;
 
     /** @var resource */
-    private $input;
+    private $stdin;
+
+    /** @var resource */
+    private $stdout;
+
+    /** @var resource */
+    private $stderr;
 
     /** @var array */
     private $descriptors;
@@ -20,6 +30,15 @@ class sh
 
     /** @var bool */
     private $toplevel;
+
+    /** @var bool */
+    private $interactive;
+
+    /** @var array */
+    private $history = array();
+
+    /** @var string */
+    private $previous_command;
 
     /** @var array */
     private $tokens = array();
@@ -41,17 +60,47 @@ class sh
      * @param array
      * @param array
      * @param array
+     * @param Executor
      * @param bool
      */
-    public function __construct(array $argv, array $envp, array $descriptors, Executor $executor)
+    public function __construct(array $argv, array $envp, array $descriptors, Executor $executor, $interactive = NULL)
     {
         $this->argv = $argv;
         $this->envp = $envp;
 
+        if (!isset($this->envp['PS1'])) {
+            $this->envp['PS1'] = self::DEFAULT_PS1;
+        }
+
+        if (!isset($this->envp['PS2'])) {
+            $this->envp['PS2'] = self::DEFAULT_PS2;
+        }
+
         $this->descriptors = $descriptors;
-        $this->input = $descriptors[0];
+        list($this->stdin, $this->stdout, $this->stderr) = $this->descriptors;
 
         $this->executor = $executor;
+
+        if (!is_bool($interactive)) {
+            $interactive = FALSE;
+
+            if (function_exists('posix_isatty') && @posix_isatty($descriptors[0])) {
+                $interactive = TRUE;
+            }
+        }
+
+        $this->interactive = $interactive;
+
+        if ($this->interactive) {
+            $this->descriptors[1] = fopen('sh-interactiveoutput://', NULL, FALSE,
+                stream_context_create(array('sh-interactiveoutput' => array(
+                    'handle' => $this->descriptors[1],
+                ))));
+            $this->descriptors[2] = fopen('sh-interactiveoutput://', NULL, FALSE,
+                stream_context_create(array('sh-interactiveoutput' => array(
+                    'handle' => $this->descriptors[2],
+                ))));
+        }
     }
 
     /** @return int */
@@ -64,7 +113,26 @@ class sh
                 $this->variables[$k] = $v;
             }
 
-            $this->interpretMoreCommands(array(), FALSE, TRUE);
+            for (;;) {
+                try {
+                    $this->interpretMoreCommands(array(), FALSE, TRUE);
+
+                    if (!$this->interactive) {
+                        break;
+                    }
+
+                } catch (SyntaxError $e) {
+                    if (!$this->interactive) {
+                        throw $e;
+                    }
+
+                    fwrite($this->stderr, "sh: syntax error\r\n");
+                    $this->tokens = array();
+
+                } catch (\Exception $e) {
+                    throw $e;
+                }
+            }
 
             return isset($this->variables['?']) ? $this->variables['?'] : 0;
 
@@ -74,8 +142,50 @@ class sh
         } catch (BuiltinReturn $e) {
             return $e->getExitStatus();
 
-        } catch (SyntaxError $e) {
-            fwrite($this->descriptors[2], $e);
+        } catch (\Exception $e) {
+            fwrite($this->stderr, $e);
+            return 255;
+        }
+    }
+
+    /**
+     * @param string
+     * @return int
+     */
+    public function exec($command)
+    {
+        try {
+            $this->variables['#'] = count($this->argv) - 1;
+
+            foreach ($this->argv as $k => $v) {
+                $this->variables[$k] = $v;
+            }
+
+            $interactive = $this->interactive;
+            $this->interactive = FALSE;
+
+            $can_read = $this->can_read;
+            $this->can_read = FALSE;
+
+            $tokens = $this->tokens;
+            $this->tokens = $this->tokenize($command);
+
+            $this->interpretMoreCommands();
+
+            $this->interactive = $interactive;
+            $this->can_read = $can_read;
+            $this->tokens = $tokens;
+
+            return isset($this->variables['?']) ? $this->variables['?'] : 0;
+
+        } catch (BuiltinExit $e) {
+            return $e->getExitStatus();
+
+        } catch (BuiltinReturn $e) {
+            return $e->getExitStatus();
+
+        } catch (\Exception $e) {
+            fwrite($this->stderr, $e);
             return 255;
         }
     }
@@ -86,9 +196,14 @@ class sh
      * @param array
      * @return int
      * */
-    public function exec(array $argv, array $envp, array $redirections)
+    public function _exec(array $argv, array $envp, array $redirections)
     {
         $descriptors = $this->descriptors;
+        $descriptors[0] = fopen('sh-interactiveinput://', NULL, FALSE,
+            stream_context_create(array('sh-interactiveinput' => array(
+                'handle' => $this->stdin,
+                'out' => $this->stdout,
+            ))));
 
         foreach ($redirections as $n => $redirection) {
             if (is_array($redirection)) {
@@ -329,7 +444,13 @@ class sh
 
         // EXTERNAL EXECUTOR
         } else {
-            return $this->variables['?'] = $this->executor->exec($argv, $envp, $descriptors);
+            $this->variables['?'] = $this->executor->exec($argv, $envp, $descriptors);
+
+            if ($this->variables['?'] === 127 && $this->interactive) {
+                fwrite($this->stderr, "sh: " . $argv[0] . " not found\r\n");
+            }
+
+            return $this->variables['?'];
         }
     }
 
@@ -675,6 +796,18 @@ class sh
         $stop = array_flip($stop);
         $this->toplevel = $toplevel;
         for ($i = 0; $this->topToken() !== NULL && !isset($stop[$this->topToken()]); ++$i) {
+            if ($this->topToken() === ';') {
+                $can_read = $this->can_read;
+                $this->can_read = FALSE;
+                while ($this->topToken() === ';') {
+                    $this->popToken();
+                }
+                $this->can_read = $can_read;
+                if (empty($this->tokens)) {
+                    break;
+                }
+            }
+
             $this->toplevel = FALSE;
             $this->interpretCommand($just_parse);
             $this->toplevel = $toplevel;
@@ -861,7 +994,7 @@ class sh
                 }
             }
 
-            $this->exec($argv, array_merge($this->envp, $merge_envp, $envp), $redirections);
+            $this->_exec($argv, array_merge($this->envp, $merge_envp, $envp), $redirections);
         }
     }
 
@@ -1018,17 +1151,145 @@ class sh
     /** @return void */
     private function loadTokens()
     {
-        if ($this->can_read && !feof($this->input)) {
-            $data = '';
-            while (strlen($data) === 0) {
-                for (;
-                    ($read = fread($this->input, 8192)) !== '';
-                    $data .= $read);
-
-                if (strlen($data) === 0) {
-                    usleep(500000);
-                    continue;
+        if ($this->can_read && !feof($this->stdin)) {
+            if (!$this->interactive) {
+                if (($data = fgets($this->stdin)) === FALSE) {
+                    throw new Error('stdin read error');
                 }
+            } else {
+                if ($this->toplevel && strlen($this->previous_command) > 0) {
+                    $this->history[] = $this->previous_command;
+                    $this->previous_command = '';
+                }
+
+                $data = $saved_data = '';
+                $cursor = 0;
+                $hindex = count($this->history);
+
+                fwrite($this->stdout, $this->envp[$this->toplevel ? 'PS1' : 'PS2']);
+
+                while (!feof($this->stdin)) {
+                    $c = fread($this->stdin, 1);
+
+                    // FIXME
+                    // ^C or ^D
+                    if (ord($c) === 0x03 || ord($c) === 0x04) {
+                        throw new BuiltinExit(0);
+
+                    // backspace
+                    } else if (ord($c) === 0x08 || ord($c) === 0x7f) {
+                        if (strlen($data) > 0 && $cursor > 0) {
+                            $new_data = substr($data, 0, $cursor - 1) . substr($data, $cursor);
+
+                            fwrite($this->stdout, str_repeat("\033[D", $cursor) .
+                                str_repeat(' ', strlen($data)) .
+                                str_repeat("\033[D", strlen($data)) .
+                                $new_data .
+                                str_repeat("\033[D", strlen($data) - $cursor));
+                            --$cursor;
+                            $data = $new_data;
+                        }
+
+                    // return
+                    } else if (ord($c) === 0x0d) {
+                        fwrite($this->stdout, "\r\n");
+
+                        if (!empty($data)) {
+                            break;
+
+                        } else {
+                            fwrite($this->stdout, $this->envp[$this->toplevel ? 'PS1' : 'PS2']);
+                        }
+
+                    // escape sequences
+                    } else if (ord($c) === 0x1b) {
+                        if (($d = fread($this->stdin, 1)) !== '[') {
+                            $data .= $d;
+                            fwrite($this->stdout, $d);
+                            ++$cursor;
+
+                        } else {
+                            $c = fread($this->stdin, 1);
+
+                            if (!$this->toplevel && ($c === 'A' || $c === 'B')) {
+                                fwrite($this->stdout, "[$c");
+                                continue;
+                            }
+
+
+                            switch ($c) {
+                                case 'A':
+                                    if ($hindex > 0) {
+                                        $saved_data = $data;
+
+                                        if ($cursor > 0) {
+                                            fwrite($this->stdout, str_repeat("\033[D", $cursor));
+                                        }
+
+                                        if (strlen($data) > 0) {
+                                            fwrite($this->stdout, str_repeat(' ', strlen($data)));
+                                            fwrite($this->stdout, str_repeat("\033[D", strlen($data)));
+                                        }
+
+                                        --$hindex;
+
+                                        $data = $this->history[$hindex];
+                                        fwrite($this->stdout, $data);
+                                        $cursor = strlen($data);
+                                    }
+                                break;
+
+                                case 'B':
+                                    if ($hindex < count($this->history)) {
+                                        $new_saved_data = $data;
+
+                                        if ($cursor > 0) {
+                                            fwrite($this->stdout, str_repeat("\033[D", $cursor));
+                                        }
+
+                                        if (strlen($data) > 0) {
+                                            fwrite($this->stdout, str_repeat(' ', strlen($data)));
+                                            fwrite($this->stdout, str_repeat("\033[D", strlen($data)));
+                                        }
+
+                                        ++$hindex;
+
+                                        $new_data = $hindex < count($this->history)
+                                                    ? $this->history[$hindex]
+                                                    : $saved_data;
+                                        $saved_data = $new_saved_data;
+
+                                        $data = $new_data;
+                                        fwrite($this->stdout, $data);
+                                        $cursor = strlen($data);
+                                    }
+                                break;
+
+                                case 'C':
+                                    if ($cursor < strlen($data)) {
+                                        fwrite($this->stdout, "\033[C");
+                                        ++$cursor;
+                                    }
+                                break;
+
+                                case 'D':
+                                    if ($cursor > 0) {
+                                        fwrite($this->stdout, "\033[D");
+                                        --$cursor;
+                                    }
+                                break;
+                            }
+                        }
+
+                    // just some data
+                    } else {
+                        $data .= $c;
+                        fwrite($this->stdout, $c);
+                        ++$cursor;
+                    }
+                }
+
+                $this->previous_command .= $data;
             }
 
             $this->tokens = array_merge($this->tokens, $this->tokenize($data));
@@ -1066,7 +1327,11 @@ class sh
     /** @return string */
     private function secondToken()
     {
-        while (count($this->tokens) < 2 && !feof($this->input)) {
+        while (count($this->tokens) < 2 && !feof($this->stdin)) {
+            if ($this->topToken() === ';') {
+                return NULL;
+            }
+
             $this->loadTokens();
         }
 
@@ -1318,7 +1583,7 @@ class sh
             $prev = $token;
         }
 
-        if (!$string && $prev !== ';') {
+        if (!$string && $prev !== ';' && $prev !== '{') {
             if ($prev === ' ') {
                 array_pop($ret);
             }

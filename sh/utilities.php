@@ -1,5 +1,5 @@
 <?php
-namespace sh\utilities;
+namespace sh\commands;
 
 function basename(array $argv, array $envp, array $descriptors)
 {
@@ -25,15 +25,17 @@ function cat(array $argv, array $envp, array $descriptors)
     $status = 0;
     foreach (array_slice($argv, 1) as $file) {
         if ($file === '-') {
-            stream_copy_to_stream($descriptors[0], $descriptors[1]);
+            $handle = $descriptors[0];
         } else {
             if (($handle = @fopen($file, 'rb')) === FALSE) {
                 $status = 1;
                 fwrite($descriptors[2], "cat: file $file does not exist\n");
                 continue;
             }
+        }
 
-            stream_copy_to_stream($handle, $descriptors[1]);
+        while (!feof($handle)) {
+            fwrite($descriptors[1], fread($handle, 8192));
         }
     }
 
@@ -42,7 +44,7 @@ function cat(array $argv, array $envp, array $descriptors)
 
 function cd(array $argv, array $envp, array $descriptors)
 {
-    return (int) !chdir($argv[1]);
+    return (int) !@\chdir($argv[1]);
 }
 
 function chmod(array $argv, array $envp, array $descriptors)

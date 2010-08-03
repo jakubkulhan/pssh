@@ -7,6 +7,12 @@ foreach (glob(__DIR__ . '/../sh/*.php') as $f) {
     require_once $f;
 }
 
+if (($exts = glob(__DIR__ . '/ext/*.php')) !== FALSE) {
+    foreach ($exts as $ext) {
+        require_once $ext;
+    }
+}
+
 const CHANNEL = 0;
 
 function disconnect(ssh\PacketProtocol $protocol, $reason, $description)
@@ -238,45 +244,6 @@ try {
         list($local_channel, $request_type, $want_reply) = ssh\parse('usb', $packet);
         check_channel($protocol, $local_channel);
 
-        $exec = function ($command) use (&$stdout, &$stderr) {
-            $in = fopen('php://memory', 'w+');
-            fwrite($in, $command);
-            fseek($in, 0);
-
-            $out = fopen('php://memory', 'w+');
-            $err = fopen('php://memory', 'w+');
-
-            $sh = new \sh\sh(
-                array('sh'),
-                array(),
-                array(
-                    0 => $in,
-                    1 => $out,
-                    2 => $err,
-                ),
-                new \sh\PhpExecutor('sh\utilities', array(
-                    'echo' => 'echo_',
-                    'false' => 'false_',
-                    'true' => 'true_',
-                    '[' => 'test',
-                ))
-            );
-
-            $exit_status = $sh->main();
-
-            fseek($out, 0);
-            fseek($err, 0);
-
-            fwrite($stderr, str_replace("\n", "\r\n", stream_get_contents($err)));
-            fwrite($stdout, str_replace("\n", "\r\n", stream_get_contents($out)));
-
-            fclose($in);
-            fclose($out);
-            fclose($err);
-
-            return $exit_status;
-        };
-
         switch ($request_type) {
             case 'pty-req':
                 list($term,
@@ -298,6 +265,9 @@ try {
                 }
             break;
 
+            case 'exec':
+                list($command) = ssh\parse('s', $packet);
+
             case 'shell':
                 $stdin = fopen('ssh-channelstdin://', NULL, FALSE, stream_context_create(array(
                     'ssh-channelstdin' => array(
@@ -310,54 +280,28 @@ try {
                     $protocol->send('bu', ssh\SSH_MSG_CHANNEL_SUCCESS, CHANNEL);
                 }
 
-                fwrite($stdout, '$ ');
-                $line = '';
-                while (!feof($stdin)) {
-                    $data = fread($stdin, 1);
-                    // ^C or ^D
-                    if (ord($data) === 0x03 || ord($data) === 0x04) {
-                        $protocol->send('bu',
-                            ssh\SSH_MSG_CHANNEL_CLOSE,
-                            $channel);
-                        break;
+                $sh = new sh\sh(
+                    array('sh'),
+                    $envp,
+                    array(
+                        0 => $stdin,
+                        1 => $stdout,
+                        2 => $stderr,
+                    ),
+                    new sh\PhpExecutor('sh\commands'),
+                    $request_type === 'shell'
+                );
 
-                    // backspace
-                    } else if (ord($data) === 0x08) {
-                        if (strlen($line) > 0) {
-                            $line = substr($line, 0, -1);
-                            fwrite($stdout, chr(0x08) . ' ' . chr(0x08));
-                        }
-
-                    // return
-                    } else if (ord($data) === 0x0d) {
-                        fwrite($stdout, "\r\n");
-                        $exec($line);
-                        $line = '';
-                        fwrite($stdout, '$ ');
-
-                    // escape sequences
-                    } else if (ord($data) === 0x1b) {
-                        // TODO
-
-                    // just some data
-                    } else {
-                        $line .= $data;
-                        fwrite($stdout, $data);
-                    }
-                }
-            break;
-
-            case 'exec':
-                list($command) = ssh\parse('s', $packet);
-
-                if ($want_reply) {
-                    $protocol->send('bu', ssh\SSH_MSG_CHANNEL_SUCCESS, CHANNEL);
+                if ($request_type === 'exec') {
+                    $exit_status = $sh->exec($command);
+                } else {
+                    $exit_status = $sh->main();
                 }
 
-                $exec($command);
+                $protocol->send('busbu', ssh\SSH_MSG_CHANNEL_REQUEST,
+                    $channel, 'exit-status', 0, $exit_status);
 
-                $protocol->send('bu',
-                    ssh\SSH_MSG_CHANNEL_CLOSE,
+                $protocol->send('bu', ssh\SSH_MSG_CHANNEL_CLOSE,
                     $channel);
             break;
 
