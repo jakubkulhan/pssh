@@ -199,15 +199,18 @@ class sh
     public function _exec(array $argv, array $envp, array $redirections)
     {
         $descriptors = $this->descriptors;
-        $descriptors[0] = fopen('sh-interactiveinput://', NULL, FALSE,
-            stream_context_create(array('sh-interactiveinput' => array(
-                'handle' => $this->stdin,
-                'out' => $this->stdout,
-            ))));
+
+        if ($this->interactive) {
+            $descriptors[0] = fopen('sh-interactiveinput://', NULL, FALSE,
+                stream_context_create(array('sh-interactiveinput' => array(
+                    'handle' => $this->stdin,
+                    'out' => $this->stdout,
+                ))));
+        }
 
         foreach ($redirections as $n => $redirection) {
             if (is_array($redirection)) {
-                if (($handle = fopen($redirection[1], $redirection[0])) === FALSE) {
+                if (($handle = @fopen($redirection[1], $redirection[0])) === FALSE) {
                     throw new Error('cannot open file ' . $redirection[1]);
                 }
 
