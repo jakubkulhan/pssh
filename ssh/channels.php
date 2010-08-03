@@ -64,6 +64,10 @@ class ChannelStdin
                 continue;
             }
 
+            if (feof($this->dispatcher->getProtocol()->getInputStream())) {
+                throw new Eof;
+            }
+
             $channel = $this->channel;
 
             $packet = $this->dispatcher->dispatch(function ($packet) use ($channel) {

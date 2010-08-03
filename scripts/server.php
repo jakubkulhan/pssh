@@ -13,32 +13,14 @@ if (($exts = glob(__DIR__ . '/ext/*.php')) !== FALSE) {
     }
 }
 
-const CHANNEL = 0;
+define('CHANNEL', 0);
+define('CONNECTIONS_DIR', __DIR__ . '/../connections');
 
-function disconnect(ssh\PacketProtocol $protocol, $reason, $description)
-{
-    $protocol->send('bus', ssh\SSH_MSG_DISCONNECT, $reason, $description);
-    die();
-}
-
-function debug()
+function disconnect($reason, $description)
 {
     global $protocol;
-
-    ob_start();
-    foreach (func_get_args() as $arg) {
-        var_dump($arg);
-    }
-    $str = "\r\n" . str_replace(array("\r\n", "\r", "\n"), "\r\n", ob_get_clean());
-
-    $protocol->send('bbsu', ssh\SSH_MSG_DEBUG, 1, $str, 0);
-}
-
-function check_channel($protocol, $channel)
-{
-    if ($channel !== CHANNEL) {
-        disconnect($protocol, ssh\SSH_DISCONNECT_BY_APPLICATION, 'Bad channel #' . $channel . '.');
-    }
+    $protocol->send('bus', ssh\SSH_MSG_DISCONNECT, $reason, $description);
+    die();
 }
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST' || !isset($_SERVER['HTTP_X_CONNECTION'])) {
@@ -46,65 +28,110 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST' || !isset($_SERVER['HTTP_X_CONNECTION'
     die();
 }
 
-$connections_dir = dirname(__FILE__) . '/../connections';
+$connection = $_SERVER['HTTP_X_CONNECTION'];
 
-$connection = trim($_SERVER['HTTP_X_CONNECTION']);
-$input = file_get_contents('php://input');
-
-if ($connection !== 'connect') { // incoming data
-    if (!($handle = @fopen($connections_dir . '/' . $connection, 'ab'))) {
+// HTTP tunnel incoming data
+if (strncmp($_SERVER['HTTP_X_CONNECTION'], 'http=', 5) === 0) {
+    if (!($handle = @fopen(CONNECTIONS_DIR . '/' . substr($_SERVER['HTTP_X_CONNECTION'], 5), 'ab'))) {
         header('HTTP/1.1 404 Not Found');
         die();
     }
 
-    if (!(fwrite($handle, $input) !== FALSE &&
+    if (!(fwrite($handle, file_get_contents('php://input')) !== FALSE &&
           fclose($handle)))
     {
         header('HTTP/1.1 500 Internal Server Error');
     }
+
     die();
 }
 
 // new connection
-$connection = sha1(uniqid('', TRUE));
-//if (!($input = @fopen($connections_dir . '/' . $connection, 'x+b'))) {
-if (!file_exists($connections_dir . '/' . $connection)) {
-    umask(0);
-    if (!posix_mkfifo($connections_dir . '/' . $connection, 0600)) {
-        header('HTTP/1.1 500 Internal Server Error');
+$requested_types = explode(', ', $_SERVER['HTTP_X_CONNECTION']);
+
+foreach ($requested_types as $type) {
+    if (strncmp($type, 'tcp=', 4) === 0) {
+        $ip = substr($type, 4);
+
+        if (($socket = stream_socket_server("tcp://$ip:0")) === FALSE) {
+            continue;
+        }
+
+        list($host, $port) = explode(':', stream_socket_get_name($socket, FALSE));
+
+        @set_time_limit(0);
+        ignore_user_abort(TRUE);
+        header('X-Connection: tcp=' . $port);
+        header('Connection: close');
+        flush();
+
+        if (($connection = stream_socket_accept($socket)) === FALSE) {
+            fclose($socket);
+            continue;
+        }
+
+        fclose($socket);
+
+        $input = $output = $connection;
+
+        break;
+
+    } else if (strncmp($type, 'http', 4) === 0) {
+        $id = sha1(uniqid('', TRUE));
+
+        if (!@posix_mkfifo(CONNECTIONS_DIR . '/' . $id, 0600)) {
+            header('HTTP/1.1 500 Internal Server Error');
+            die();
+        }
+
+        if (!($input = @fopen(CONNECTIONS_DIR . '/' . $id, 'r+'))) {
+            header('HTTP/1.1 500 Internal Server Error');
+            die();
+        }
+
+        function _on_shutdown($filename, $handle) {
+            fclose($handle);
+            @unlink($filename);
+        }
+
+        register_shutdown_function(function ($filename, $handle) {
+            fclose($handle);
+            @unlink($filename);
+        }, CONNECTIONS_DIR . '/' . $id, $input);
+
+        header('X-Connection: http=' . $id);
+        header('Content-Type: application/octet-stream');
+
+        if (function_exists('apache_setenv')) {
+            @apache_setenv('no-gzip', 1);
+        }
+
+        @ini_set('zlib.output_compression', 0);
+        @ini_set('output_buffering', 0);
+        @ini_set('implicit_flush', 1);
+
+        for ($i = 0; $i < ob_get_level(); ++$i) {
+            ob_end_flush();
+        }
+
+        ob_implicit_flush(1);
+        @set_time_limit(0);
+        ignore_user_abort(FALSE);
+
+        $output = fopen('ssh-utils-streamedresponse://', NULL);
+
+        break;
+
+    } else {
+        header('HTTP/1.1 400 Bad Request');
         die();
     }
 }
 
-
-if (!($input = fopen($connections_dir . '/' . $connection, 'r+'))) {
+if (!isset($input) || !isset($output)) {
     header('HTTP/1.1 500 Internal Server Error');
     die();
 }
-
-register_shutdown_function(function ($filename, $handle) {
-    fclose($handle);
-    @unlink($filename);
-}, $connections_dir . '/' . $connection, $input);
-
-header('X-Connection: ' . $connection);
-header('Content-Type: application/octet-stream');
-
-if (function_exists('apache_setenv')) {
-    @apache_setenv('no-gzip', 1);
-}
-
-@ini_set('zlib.output_compression', 0);
-@ini_set('output_buffering', 0);
-@ini_set('implicit_flush', 1);
-
-for ($i = 0; $i < ob_get_level(); ++$i) {
-    ob_end_flush();
-}
-
-ob_implicit_flush(1);
-@set_time_limit(0);
-ignore_user_abort(false);
 
 $keys = array();
 foreach (array('id_rsa', 'id_dsa') as $type) {
@@ -119,7 +146,6 @@ foreach (array('id_rsa', 'id_dsa') as $type) {
 }
 
 $authenticator = new ssh\ConnectionPublickeyAuthenticator(__DIR__ . '/../users');
-$output = fopen('ssh-utils-streamedresponse://', NULL);
 $protocol = new ssh\PacketProtocol($input, $output);
 
 $server_identification_string = 'SSH-2.0-pssh';
@@ -132,7 +158,7 @@ if (($client_identification_string = fgets($input)) === FALSE) {
 if (strncmp($client_identification_string, 'SSH-2.0-', 8) !== 0 ||
     substr($client_identification_string, -2) !== "\r\n")
 {
-    disconnect($protocol, ssh\SSH_DISCONNECT_PROTOCOL_ERROR, 'Bad identification string.');
+    disconnect(ssh\SSH_DISCONNECT_PROTOCOL_ERROR, 'Bad identification string.');
 }
 
 $client_identification_string =
@@ -146,7 +172,7 @@ try {
         $keys
     );
 } catch (\Exception $e) {
-    disconnect($protocol, SSH_DISCONNECT_KEY_EXCHANGE_FAILED, $e->getMessage());
+    disconnect(ssh\SSH_DISCONNECT_KEY_EXCHANGE_FAILED, $e->getMessage());
 }
 
 $dispatcher = new ssh\Dispatcher($protocol);
@@ -159,8 +185,8 @@ try {
 
     $dispatcher->on(ssh\SSH_MSG_IGNORE, NULL);
 
-    $dispatcher->on(ssh\SSH_MSG_UNIMPLEMENTED, function () use (&$protocol) {
-        disconnect($protocol, ssh\SSH_DISCONNECT_PROTOCOL_ERROR, 'Sorry for my bad packet.');
+    $dispatcher->on(ssh\SSH_MSG_UNIMPLEMENTED, function () {
+        disconnect(ssh\SSH_DISCONNECT_PROTOCOL_ERROR, 'Sorry for my bad packet.');
     });
 
     $dispatcher->on(ssh\SSH_MSG_DEBUG, NULL);
@@ -169,7 +195,7 @@ try {
         list($service) = ssh\parse('s', $packet);
 
         if ($service !== 'ssh-userauth') {
-            disconnect($protocol, ssh\SSH_DISCONNECT_SERVICE_NOT_AVAILABLE, $service . ' not supported.');
+            disconnect(ssh\SSH_DISCONNECT_SERVICE_NOT_AVAILABLE, $service . ' not supported.');
         }
 
         $protocol->send('bs', ssh\SSH_MSG_SERVICE_ACCEPT, $service);
@@ -236,13 +262,16 @@ try {
 
     $dispatcher->on(ssh\SSH_MSG_CHANNEL_WINDOW_ADJUST, NULL);
 
-    $dispatcher->on(ssh\SSH_MSG_CHANNEL_CLOSE, function ($packet) use (&$protocol) {
-        disconnect($protocol, ssh\SSH_DISCONNECT_BY_APPLICATION, 'Bye bye.');
+    $dispatcher->on(ssh\SSH_MSG_CHANNEL_CLOSE, function ($packet) {
+        disconnect(ssh\SSH_DISCONNECT_BY_APPLICATION, 'Bye bye.');
     });
 
     $dispatcher->on(ssh\SSH_MSG_CHANNEL_REQUEST, function ($packet) use (&$protocol, &$dispatcher, &$envp, &$stdout, &$stderr, &$channel, &$window_size) {
         list($local_channel, $request_type, $want_reply) = ssh\parse('usb', $packet);
-        check_channel($protocol, $local_channel);
+
+        if ($local_channel !== CHANNEL) {
+            disconnect(ssh\SSH_DISCONNECT_BY_APPLICATION, 'Bad channel #' . $local_channel . '.');
+        }
 
         switch ($request_type) {
             case 'pty-req':
@@ -325,9 +354,16 @@ try {
             continue;
         }
 
+        if (feof($input)) {
+            throw new ssh\Eof;
+        }
+
         $dispatcher->dispatch();
     }
 
+} catch (ssh\Eof $e) {
+    die();
+
 } catch (\Exception $e) {
-    disconnect($protocol, ssh\SSH_DISCONNECT_BY_APPLICATION, $e->getMessage());
+    disconnect(ssh\SSH_DISCONNECT_BY_APPLICATION, $e->getMessage());
 }

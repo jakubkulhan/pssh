@@ -20,3 +20,7 @@ class MacError extends Error
 class Disconnected extends \Exception
 {
 }
+
+class Eof extends \Exception
+{
+}
