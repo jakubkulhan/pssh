@@ -18,12 +18,18 @@ function basename(array $argv, array $envp, array $descriptors)
 
 function cat(array $argv, array $envp, array $descriptors)
 {
-    if ($argv[1] === '-u') {
-        $argv = array_slice($argv, 1);
+    array_shift($argv);
+
+    if (isset($argv[0]) && $argv[0] === '-u') {
+        array_shift($argv);
+    }
+
+    if (empty($argv)) {
+        $argv[] = '-';
     }
 
     $status = 0;
-    foreach (array_slice($argv, 1) as $file) {
+    foreach ($argv as $file) {
         if ($file === '-') {
             $handle = $descriptors[0];
         } else {
