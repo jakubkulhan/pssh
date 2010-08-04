@@ -92,6 +92,11 @@ class sh
         $this->interactive = $interactive;
 
         if ($this->interactive) {
+            $descriptors[0] = fopen('sh-interactiveinput://', NULL, FALSE,
+                stream_context_create(array('sh-interactiveinput' => array(
+                    'handle' => $this->stdin,
+                    'out' => $this->stdout,
+                ))));
             $this->descriptors[1] = fopen('sh-interactiveoutput://', NULL, FALSE,
                 stream_context_create(array('sh-interactiveoutput' => array(
                     'handle' => $this->descriptors[1],
@@ -199,14 +204,6 @@ class sh
     public function _exec(array $argv, array $envp, array $redirections)
     {
         $descriptors = $this->descriptors;
-
-        if ($this->interactive) {
-            $descriptors[0] = fopen('sh-interactiveinput://', NULL, FALSE,
-                stream_context_create(array('sh-interactiveinput' => array(
-                    'handle' => $this->stdin,
-                    'out' => $this->stdout,
-                ))));
-        }
 
         foreach ($redirections as $n => $redirection) {
             if (is_array($redirection)) {
